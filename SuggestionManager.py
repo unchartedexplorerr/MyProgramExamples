@@ -12,8 +12,8 @@ TOKEN = ""
 cfg_file = "configs.json"
 cfg = {}
 
-# This loads configs from file
 def load_configs():
+    # Load the persistent server-specific configuration used by the suggestion system, populate the module-level 'cfg' dictionary, and fall back to an empty mapping on file errors so the bot can continue operating.
     global cfg
     try:
         if os.path.exists(cfg_file):
@@ -23,32 +23,35 @@ def load_configs():
         else:
             cfg = {}
             print("No config file found, starting fresh")
-    except Exception as e:
+    except Exception:
         cfg = {}
 
-# This saves configs
 def save_configs():
+    # Persist the in-memory configuration to disk; swallow write errors to avoid crashing the bot on I/O failures and allow admins to inspect logs.
     try:
         with open(cfg_file, 'w') as f:
             json.dump(cfg, f, indent=2)
         print(f"Saved {len(cfg)} server configs")
-    except Exception as e:
+    except Exception:
         pass
 
 
 class SuggestionBot(commands.Bot):
     def __init__(self):
+        # Require message content and reaction intents to support the suggestion workflow.
         intents = discord.Intents.default()
         intents.message_content = True
         intents.reactions = True
         super().__init__(command_prefix='!', intents=intents)
         
     async def setup_hook(self):
+        # During startup load saved configs and sync slash commands with Discord.
         load_configs()
         await self.tree.sync()
         print(f"Synced commands for {self.user}")
     
     async def on_ready(self):
+        # Print ready status and set presence so maintainers can verify the bot is active.
         print(f'{self.user} has landed!')
         print(f'Bot is in {len(self.guilds)} servers')
         
@@ -59,7 +62,7 @@ class SuggestionBot(commands.Bot):
             )
         )
     
-    # When bot joins a server, spam a welcome message
+    # On joining a guild, send a brief welcome that includes quick setup instructions so administrators can configure the suggestion workflow without external docs.
     async def on_guild_join(self, guild):
         print(f"Joined new server: {guild.name}")
         
@@ -78,7 +81,7 @@ class SuggestionBot(commands.Bot):
                     break
         
         if ch:
-            # Huge embed, looks cool yeah
+            # Prepare a welcome embed with concise setup instructions to guide administrators.
             embed = discord.Embed(
                 title="🎉 Thanks for adding me!",
                 description="I'm here to help manage your server suggestions with an awesome approval workflow!",
@@ -112,6 +115,7 @@ class SuggestionBot(commands.Bot):
 bot = SuggestionBot()
 
 def get_config(gid: int) -> Dict[str, Any]:
+    # Return or create a guild-specific config mapping (channel IDs and threshold); keep 'sent_for_approval' as an in-memory set for fast checks and convert to a list before persisting for JSON compatibility.
     gid_str = str(gid)
     if gid_str not in cfg:
         cfg[gid_str] = {
@@ -133,10 +137,13 @@ def get_config(gid: int) -> Dict[str, Any]:
     return cfg[gid_str]
 
 def save_config(gid: int, config: Dict[str, Any]):
+    # Update the in-memory config for a guild and persist to disk.
+    # The function expects the caller to provide a properly formed
+    # config dict (channel ids as integers, threshold as int, etc.).
     cfg[str(gid)] = config
     save_configs()
 
-# Setup command, does everything at once
+# Provide a `/setup` slash command that configures suggestion, approval, and featured channels plus the thumbs-up threshold for a guild.
 @bot.tree.command(name="setup", description="Setup all channels and threshold in one command")
 @app_commands.describe(
     suggestion_channel="The channel where users will post suggestions",
@@ -182,7 +189,7 @@ async def setup(
     config['threshold'] = threshold
     save_config(interaction.guild.id, config)
 
-# Change the threshold, only admins can do it tho
+# Provide a `/set_threshold` command restricted to administrators to update the number of 👍 reactions required to send a suggestion for approval.
 @bot.tree.command(name="set_threshold", description="Set the number of thumbs up needed for approval")
 @app_commands.describe(amount="Number of 👍 reactions needed")
 async def set_threshold(interaction: discord.Interaction, amount: int):
@@ -205,7 +212,7 @@ async def set_threshold(interaction: discord.Interaction, amount: int):
     config['threshold'] = amount
     save_config(interaction.guild.id, config)
 
-# Show current config, anyone can see
+# Provide a `/view_config` command to display the current suggestion system settings for the guild, including channel mentions and threshold.
 @bot.tree.command(name="view_config", description="View current suggestion system configuration")
 async def view_config(interaction: discord.Interaction):
     config = get_config(interaction.guild.id)
@@ -225,7 +232,7 @@ async def view_config(interaction: discord.Interaction):
     
     await interaction.response.send_message(embed=embed)
 
-# Auto react to suggestions
+# Auto-react to new messages posted in the configured suggestion channel with 👍 and 👎 so the community can vote immediately.
 @bot.event
 async def on_message(msg):
     if msg.author.bot:
@@ -238,7 +245,7 @@ async def on_message(msg):
         await msg.add_reaction('👎')
         print(f"Added thumbs up and thumbs down reactions to suggestion in {msg.guild.name}")
 
-# Check if enough reactions for approval
+# When someone adds a reaction, check whether the message in the suggestion channel reached the configured thumbs-up threshold and send it to the approval channel if so.
 @bot.event
 async def on_reaction_add(reaction, user):
     if user.bot:
@@ -276,7 +283,7 @@ async def on_reaction_add(reaction, user):
         
         await send_to_approval(reaction.message, config)
 
-# Send suggestion to approval channel
+# Build and send an approval embed to the configured approval channel and attach the ApprovalView so moderators can accept or deny the suggestion.
 async def send_to_approval(msg, config):
     app_ch = bot.get_channel(config['approval_channel'])
     if not app_ch:
@@ -307,7 +314,7 @@ async def send_to_approval(msg, config):
     
     await app_ch.send(embed=embed, view=view)
 
-# Buttons for approve/deny
+# ApprovalView provides Approve and Deny buttons for staff; the Approve button opens an ApprovalModal to collect optional admin notes.
 class ApprovalView(discord.ui.View):
     def __init__(self, msg, config):
         super().__init__(timeout=None)
@@ -343,7 +350,7 @@ class ApprovalView(discord.ui.View):
         
         await interaction.response.edit_message(embed=embed, view=self)
 
-# Modal for approval notes
+# ApprovalModal collects an optional admin note when approving a suggestion, posts the approved suggestion to the featured channel, creates a discussion thread, and DMs the suggestion author if possible.
 class ApprovalModal(discord.ui.Modal, title='Approve Suggestion'):
     def __init__(self, msg, config, app_msg):
         super().__init__()
