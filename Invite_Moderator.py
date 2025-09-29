@@ -10,21 +10,21 @@ import os
 TOKEN = ""
 config_file = "config.json"
 
-# This loads the active guilds from a JSON config file
 def load_config():
+    # Load the list of guild IDs where NSFW invite filtering is enabled; the configuration is a small JSON file that stores an 'active_guilds' list and we return a set for efficient membership checks, falling back to an empty set and creating a default file if the file is missing or cannot be parsed, and we tolerate parse errors so a transient corrupted file does not stop the bot from running.
     if os.path.exists(config_file):
         try:
             with open(config_file, 'r') as f:
                 data = json.load(f)
                 return set(data.get('active_guilds', []))
-        except Exception as e:
+        except Exception:
             return set()
     else:
         save_config(set())
         return set()
 
-# This saves the active guilds to a JSON config file
 def save_config(guilds):
+    # Persist the active guilds set to disk as JSON; convert the set to a list because JSON cannot represent sets and perform a best-effort write that silently ignores failures so the bot continues running if the file system is unavailable.
     try:
         config_data = {
             'active_guilds': list(guilds)
@@ -32,7 +32,9 @@ def save_config(guilds):
         with open(config_file, 'w') as f:
             json.dump(config_data, f, indent=2)
         print(f"Config saved with {len(guilds)} active guilds")
-    except Exception as e:
+    except Exception:
+        # Ignore write errors to avoid crashing in production if disk is
+        # not writable; administrators can check logs to diagnose.
         pass
 
 INTENTS = discord.Intents.default()
@@ -69,8 +71,8 @@ KEYWORDS = [
     'x-rated',     'adult entertainment', 'adult content'
 ]
 # TODO: add more keywords if needed
-# This creates regex patterns to match NSFW keywords, including leetspeak variations
 def create_regex_patterns():
+    # Build a combined regular expression that matches any NSFW keyword or a leetspeak variant and return a single alternation string for re.search(..., re.IGNORECASE); each keyword appears twice in the pattern (escaped literal and a substituted version with simple character classes like 'a' -> '[a@4]') to detect common obfuscations while keeping the pattern compact.
     patterns = []
     for keyword in KEYWORDS:
         escaped_keyword = re.escape(keyword)
@@ -90,6 +92,8 @@ def create_regex_patterns():
             fr'\b{escaped_keyword}\b',
             fr'\b{substituted}\b',
         ])
+    # Wrap each alternative in a group and join with '|' so the final
+    # pattern can be used directly in re.search.
     return '|'.join(f'({pattern})' for pattern in patterns)
 
 PATTERN = create_regex_patterns()
@@ -105,21 +109,26 @@ INVITE_PATTERNS = [
     r'discord\.li/[a-zA-Z0-9]+',
 ]
 
-# Bot startup event, sets presence and syncs slash commands
 @bot.event
 async def on_ready():
+    # Called once the bot has connected and is ready; set a presence and attempt to sync application commands so slash commands register with Discord while allowing sync failures to be non-fatal.
     print(f'{bot.user} has connected to Discord!')
     print(f'Loaded {len(guilds)} active guilds from config')
     await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="invites"))
     try:
         synced = await bot.tree.sync()
         print(f'Synced {len(synced)} command(s)')
-    except Exception as e:
+    except Exception:
+        # If command sync fails (rate limit, permissions), let the bot
+        # continue running and surface the issue through logs.
         pass
 
-# Slash command to activate NSFW invite filtering in a server
 @bot.tree.command(name="activate", description="Activate NSFW invite filtering for this server")
 async def activate(interaction: discord.Interaction):
+    # Toggle the filter on for the guild where the command is invoked.
+    # Only users with Manage Server / Administrator permissions or the
+    # server owner may use this command. The guild id is stored in the
+    # in-memory set and persisted to disk.
     if not (interaction.user.guild_permissions.manage_guild or 
             interaction.user.guild_permissions.administrator or 
             interaction.user.id == interaction.guild.owner_id):
@@ -134,9 +143,11 @@ async def activate(interaction: discord.Interaction):
         save_config(guilds)
         await interaction.response.send_message(" NSFW invite filtering has been **activated** for this server.\nI will now monitor and delete messages containing NSFW server invites.", ephemeral=True)
 
-# Slash command to deactivate filtering
 @bot.tree.command(name="deactivate", description="Deactivate NSFW invite filtering for this server")
 async def deactivate(interaction: discord.Interaction):
+    # Turn off filtering for the current guild. Permission checks are the
+    # same as for activation. Removing the guild id stops on_message
+    # from scanning messages in that server.
     if not (interaction.user.guild_permissions.manage_guild or 
             interaction.user.guild_permissions.administrator or 
             interaction.user.id == interaction.guild.owner_id):
@@ -151,9 +162,10 @@ async def deactivate(interaction: discord.Interaction):
         save_config(guilds)
         await interaction.response.send_message(" NSFW invite filtering has been **deactivated** for this server.", ephemeral=True)
 
-# Slash command to check if filtering is active
 @bot.tree.command(name="status", description="Check if NSFW invite filtering is active")
 async def status(interaction: discord.Interaction):
+    # Inform the user whether the filter is currently enabled for their
+    # guild. This reads the in-memory set populated on startup.
     guild_id = interaction.guild.id
     is_active = guild_id in guilds
     status_emoji = "🟢" if is_active else "🔴"
@@ -161,8 +173,11 @@ async def status(interaction: discord.Interaction):
     
     await interaction.response.send_message(f"{status_emoji} NSFW invite filtering is {status_text} in this server.", ephemeral=True)
 
-# This fetches the server name from a Discord invite code using the API
 async def get_invite_info(code):
+    # Query Discord's public invite API to retrieve invite metadata.
+    # We only extract the guild name which is sufficient for our
+    # keyword-based NSFW heuristic. Any network or API error results in
+    # returning None so the caller treats the invite as unknown.
     try:
         async with aiohttp.ClientSession() as session:
             url = f"https://discord.com/api/v10/invites/{code}"
@@ -173,11 +188,13 @@ async def get_invite_info(code):
                     return guild_name
                 else:
                     return None
-    except Exception as e:
+    except Exception:
         return None
 
-# This extracts invite codes from message text using regex patterns
 def extract_invite_codes(text):
+    # Run several regexes that match common Discord invite formats and
+    # return the trailing path segment for each match (the invite code).
+    # Very short tokens are ignored to reduce false positives.
     codes = []
     for pattern in INVITE_PATTERNS:
         matches = re.findall(pattern, text, re.IGNORECASE)
@@ -187,16 +204,24 @@ def extract_invite_codes(text):
                 codes.append(code)
     return codes
 
-# This checks if a server name contains NSFW keywords using regex
 def is_nsfw_server_name(name):
+    # Heuristic check: return True if the provided guild name matches
+    # any of the compiled NSFW keyword alternatives. Empty or missing
+    # names return False.
     if not name:
         return False
     
     return bool(re.search(PATTERN, name, re.IGNORECASE))
 
-# Main event that monitors messages for NSFW invites and deletes them
 @bot.event
 async def on_message(message):
+    # Watch messages in configured guilds and remove invites that point
+    # to servers we consider NSFW. The handler skips bots and DMs, only
+    # runs in guilds listed in the `guilds` set, extracts invite codes
+    # from the message text, asks `get_invite_info` for the target guild
+    # name, and then uses `is_nsfw_server_name` to decide whether to
+    # delete the message and post a short temporary warning to the
+    # channel.
     if message.author.bot or not message.guild:
         return
     
@@ -211,6 +236,8 @@ async def on_message(message):
             
             if name and is_nsfw_server_name(name):
                 try:
+                    # Remove the offending message to prevent access to
+                    # the invite and notify the author briefly.
                     await message.delete()
                     
                     warning_msg = await message.channel.send(
@@ -218,20 +245,26 @@ async def on_message(message):
                         f"Server: `{name}`"
                     )
                     
+                    # Keep the notification visible for a short time,
+                    # then delete it to keep channels clean.
                     await asyncio.sleep(5)
                     try:
                         await warning_msg.delete()
-                    except:
+                    except Exception:
                         pass
                     
                     print(f"Deleted NSFW invite from {message.author} in {message.guild.name}: {name}")
                     break
                     
                 except discord.errors.NotFound:
+                    # Message already deleted or channel removed.
                     pass
                 except discord.errors.Forbidden:
+                    # Lacking permissions to delete/send messages.
                     pass
-                except Exception as e:
+                except Exception:
+                    # Catch-all to avoid crashing on unexpected runtime
+                    # errors while processing other messages.
                     pass
 
 
