@@ -15,11 +15,13 @@ TOKEN = ""
 
 def create_quit_button(callback):
     btn = discord.ui.Button(label='Quit Game', style=discord.ButtonStyle.danger)
+    # Helper to create a standardized "Quit Game" button with the provided callback; this keeps button creation concise at call sites where we only need a simple quit action.
     btn.callback = callback
     return btn
 
 def create_rematch_button(callback, label='Rematch'):
     btn = discord.ui.Button(label=label, style=discord.ButtonStyle.success)
+    # Helper to create a rematch button; the label can be overridden for contexts like "Rematch vs AI", and the callback should be an async callable that accepts the interaction parameter.
     btn.callback = callback
     return btn
 
@@ -27,8 +29,7 @@ def create_rematch_button(callback, label='Rematch'):
 def init_db():
     conn = sqlite3.connect('games.db')
     c = conn.cursor()
-    
-    # Table for game results
+    # Initialize a lightweight sqlite database to persist game results and user progression; the schema is intentionally small (game_stats for optional history and user_points for aggregated points, level, and simple win/loss/draw counters) so the bot runs without external dependencies while keeping persistent storage across restarts.
     c.execute('''CREATE TABLE IF NOT EXISTS game_stats (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER,
@@ -81,8 +82,7 @@ bot = MiniGameBot()
 def add_points(user_id, guild_id, points, result):
     conn = sqlite3.connect('games.db')
     c = conn.cursor()
-    
-    # Insert user if not exists
+    # Adjust a user's stored points and simple stats after a game: ensure a user row exists, update points/wins/losses/draws based on the result, compute level as (total_points // 100) + 1, and return the new level; the function uses a short-lived sqlite connection per call to avoid connection-pooling complexity.
     c.execute('''INSERT OR IGNORE INTO user_points 
                  (user_id, guild_id, total_points, level, wins, losses, draws) 
                  VALUES (?, ?, 0, 1, 0, 0, 0)''', (user_id, guild_id))
@@ -97,11 +97,13 @@ def add_points(user_id, guild_id, points, result):
                      SET losses = losses + 1 
                      WHERE user_id = ?''', (user_id,))
     else:  # draw
+        # For draws we award half points (integer division) and increment
+        # the draws counter.
         c.execute('''UPDATE user_points 
                      SET total_points = total_points + ?, draws = draws + 1 
                      WHERE user_id = ?''', (points//2, user_id))
     
-    # Level up check
+    # Level up check: simple linear progression based on total_points.
     c.execute('SELECT total_points FROM user_points WHERE user_id = ?', (user_id,))
     total = c.fetchone()[0]
     new_level = (total // 100) + 1
@@ -517,8 +519,9 @@ class RPSView(discord.ui.View):
         emojis = {'rock': '🪨', 'paper': '📄', 'scissors': '✂️'}
         return emojis[choice]
 
-# AI for Tic Tac Toe
+# Tic Tac Toe
 class TicTacToeAI:
+    # Simple rule-based Tic Tac Toe AI that uses a lightweight greedy strategy: take a winning move if available, block opponent wins, prefer center then corners, otherwise pick a random available square; checks use temporary board mutations when testing hypothetical moves.
     def get_best_move(self, board):
         # Check for winning moves
         for i in range(9):
@@ -563,6 +566,10 @@ class TicTacToeAI:
 @bot.tree.command(name="tictactoe", description="Play tic tac toe with another player or AI")
 @app_commands.describe(opponent="The player you want to challenge (leave blank for AI)")
 async def tictactoe(interaction: discord.Interaction, opponent: discord.Member = None):
+    # Create a new Tic Tac Toe session either between two players or
+    # between the invoking user and the AI. The command builds an embed
+    # showing the initial board and attaches the appropriate interactive
+    # view (TicTacToeView or TicTacToeAIView).
     if opponent and opponent.bot and opponent != bot.user:
         await interaction.response.send_message("Cannot challenge other bots!", ephemeral=True)
         return
@@ -598,6 +605,10 @@ async def tictactoe(interaction: discord.Interaction, opponent: discord.Member =
 @bot.tree.command(name="rps", description="Play rock paper scissors")
 @app_commands.describe(opponent="Player to challenge (optional - leave blank to play vs AI)")
 async def rps(interaction: discord.Interaction, opponent: discord.Member = None):
+    # Start a rock-paper-scissors game. If no opponent is provided the
+    # user plays against the bot; otherwise an interactive two-player
+    # view is created. The function handles result calculation and
+    # awards points via add_points.
     if opponent and opponent.bot and opponent != bot.user:
         await interaction.response.send_message("Cannot challenge other bots!", ephemeral=True)
         return
@@ -1349,4 +1360,4 @@ if __name__ == "__main__":
     try:
         bot.run(TOKEN)
     except Exception as e:
-        print(f"Error starting gaming bot: {e}")
+        print(f"Error {e}")
